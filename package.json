@@ -6,6 +6,10 @@
     "build": "tsc && vite build"
   },
   "dependencies": {
+    "@splinetool/react-spline": "^4.1.0",
+    "@splinetool/runtime": "^1.12.67",
+    "@turf/turf": "^7.3.4",
+    "@types/turf": "^3.5.32",
     "framer-motion": "^12.35.0",
     "leaflet": "^1.9.4",
     "lucide-react": "^0.577.0",
