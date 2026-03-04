@@ -1,11 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Plane, AlertCircle, Clock, ShieldAlert, Activity,
-  Map as MapIcon, ChevronRight, SignalHigh, PlaySquare, Compass, Search, X
+  Map as MapIcon, SignalHigh, Compass, Search, X,
+  History, ThermometerSun, AlertTriangle, Globe
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { MapContainer, TileLayer, Marker, Popup, Circle, Polyline, useMap, useMapEvents } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Polygon, Polyline, useMap, useMapEvents } from 'react-leaflet';
 import L from 'leaflet';
+import GlobeComponent from 'react-globe.gl';
+import { booleanPointInPolygon, point, polygon } from '@turf/turf';
 import './index.css';
 
 interface FlightState {
@@ -19,6 +22,7 @@ interface FlightState {
   velocity: number;
   heading: number;
   onGround: boolean;
+  squawk?: string;
 }
 
 interface FlightDetails {
@@ -32,48 +36,63 @@ interface FlightDetails {
 const CENTER_LAT = 25.25;
 const CENTER_LON = 55.36;
 
-const createPlaneIcon = (heading: number, isSelected: boolean) => {
-  const bgColor = isSelected ? '#ef4444' : '#FFD700';
+// GeoFence Polygons
+const THREAT_ZONES = [
+  {
+    name: "Ukraine Airspace",
+    color: "#ef4444",
+    coords: [[52.0, 23.0], [52.0, 40.0], [44.0, 40.0], [44.0, 29.0], [48.0, 22.0]] as [number, number][]
+  },
+  {
+    name: "Sudan Conflict Zone",
+    color: "#ef4444",
+    coords: [[22.0, 24.0], [22.0, 37.0], [9.0, 37.0], [9.0, 23.0]] as [number, number][]
+  },
+  {
+    name: "Middle East Red Zone",
+    color: "#f97316",
+    coords: [[38.0, 42.0], [38.0, 62.0], [25.0, 62.0], [12.0, 52.0], [12.0, 42.0], [30.0, 38.0]] as [number, number][]
+  }
+];
+
+const getHeatmapColor = (altitudeFt: number) => {
+  if (altitudeFt < 5000) return '#ef4444'; // Red (Low)
+  if (altitudeFt < 15000) return '#f97316'; // Orange
+  if (altitudeFt < 25000) return '#eab308'; // Yellow
+  if (altitudeFt < 35000) return '#22c55e'; // Green
+  return '#3b82f6'; // Blue (Cruising)
+};
+
+const createPlaneIcon = (heading: number, isSelected: boolean, altitudeFt: number, isHeatmap: boolean, squawk?: string) => {
+  const isEmergency = squawk === '7700' || squawk === '7600' || squawk === '7500';
+  let bgColor = '#FFD700'; // Default Yellow
+
+  if (isEmergency) bgColor = '#ff0000';
+  else if (isSelected) bgColor = '#ffffff';
+  else if (isHeatmap) bgColor = getHeatmapColor(altitudeFt);
+
+  const filter = isEmergency ? 'drop-shadow(0 0 8px rgba(255,0,0,0.8))' : 'drop-shadow(0px 2px 3px rgba(0,0,0,0.6))';
+  const size = isSelected ? 32 : 28;
+
   const html = `
-    <div style="transform: rotate(${heading}deg); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; filter: drop-shadow(0px 2px 3px rgba(0,0,0,0.6));">
-      <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="${bgColor}" stroke="#000000" stroke-width="1">
+    <div style="transform: rotate(${heading}deg); width: ${size}px; height: ${size}px; display: flex; align-items: center; justify-content: center; filter: ${filter};">
+      <svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 24 24" fill="${bgColor}" stroke="#000000" stroke-width="1">
         <path d="M21,16v-2l-8-5V3.5c0-0.83-0.67-1.5-1.5-1.5S10,2.67,10,3.5V9l-8,5v2l8-2.5V19l-2,1.5V22l3.5-1l3.5,1v-1.5L13,19v-5.5L21,16z"/>
       </svg>
     </div>
   `;
-  return L.divIcon({
-    html,
-    className: 'custom-plane-icon',
-    iconSize: [28, 28],
-    iconAnchor: [14, 14],
-    popupAnchor: [0, -10]
-  });
+  return L.divIcon({ html, className: 'custom-plane-icon', iconSize: [size, size], iconAnchor: [size / 2, size / 2], popupAnchor: [0, -10] });
 };
 
 const MapUpdater = ({ flyToLocation }: { flyToLocation: [number, number] | null }) => {
   const map = useMap();
-  useEffect(() => {
-    if (flyToLocation) {
-      map.flyTo(flyToLocation, 9, { animate: true, duration: 1.5 });
-    }
-  }, [flyToLocation, map]);
+  useEffect(() => { if (flyToLocation) map.flyTo(flyToLocation, 7, { animate: true, duration: 1.5 }); }, [flyToLocation, map]);
   return null;
 };
 
-// Component to track bounding box to fetch only visible aircraft
 const MapBoundsFetcher = ({ boundsRef }: { boundsRef: React.MutableRefObject<[number, number, number, number] | null> }) => {
-  const map = useMapEvents({
-    moveend: () => {
-      const b = map.getBounds();
-      boundsRef.current = [b.getSouth(), b.getWest(), b.getNorth(), b.getEast()];
-    }
-  });
-
-  useEffect(() => {
-    const b = map.getBounds();
-    boundsRef.current = [b.getSouth(), b.getWest(), b.getNorth(), b.getEast()];
-  }, [map, boundsRef]);
-
+  const map = useMapEvents({ moveend: () => { const b = map.getBounds(); boundsRef.current = [b.getSouth(), b.getWest(), b.getNorth(), b.getEast()]; } });
+  useEffect(() => { const b = map.getBounds(); boundsRef.current = [b.getSouth(), b.getWest(), b.getNorth(), b.getEast()]; }, [map, boundsRef]);
   return null;
 };
 
@@ -87,37 +106,42 @@ const SafeFlightsApp = () => {
 
   const [selectedFlightTrack, setSelectedFlightTrack] = useState<[number, number][]>([]);
   const [selectedFlightDetails, setSelectedFlightDetails] = useState<FlightDetails | null>(null);
-
   const boundsRef = useRef<[number, number, number, number] | null>(null);
 
-  // Search State
+  // Search & UI Features State
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [liveSearchResults, setLiveSearchResults] = useState<FlightState[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [selectedAirportBoard, setSelectedAirportBoard] = useState<{ name: string, lat: number, lon: number } | null>(null);
 
+  // Pro Features State
+  const [timeOffset, setTimeOffset] = useState(0); // 0 = Live, -24 to -1 hours
+  const [isHeatmap, setIsHeatmap] = useState(false);
+  const [viewMode, setViewMode] = useState<"2D" | "3D">("2D");
+  const [emergencies, setEmergencies] = useState<FlightState[]>([]);
+  const [geofenceAlerts, setGeofenceAlerts] = useState<{ flight: string, zone: string }[]>([]);
+
   // Time ticker
   useEffect(() => {
-    const timer = setInterval(() => setCurrentTime(new Date()), 1000);
+    const timer = setInterval(() => setCurrentTime(new Date(Date.now() + timeOffset * 3600000)), 1000);
     return () => clearInterval(timer);
-  }, []);
+  }, [timeOffset]);
 
-  // API Fetch loop with robust 3-tier fallback
+  // Main Tracking Loop
   useEffect(() => {
     let active = true;
 
-    // Synthetic fallback generator
     const generateSyntheticFlights = (b: [number, number, number, number]) => {
       const [lamin, lomin, lamax, lomax] = b;
       const airlines = ['UAE', 'EY', 'FZ', 'G9', 'BAW', 'DLH', 'QFA', 'AFR', 'SIA', 'AIC', 'IGO'];
       const countries = ['UAE', 'UK', 'Germany', 'Australia', 'France', 'Singapore', 'India', 'USA'];
       const newFlights = [];
-      const numToGen = Math.min(45, Math.floor(Math.abs((lamax - lamin) * (lomax - lomin)) * 10) + 10);
+      const numToGen = Math.min(80, Math.floor(Math.abs((lamax - lamin) * (lomax - lomin)) * 10) + 10);
 
       for (let i = 0; i < numToGen; i++) {
-        const alt = Math.floor(Math.random() * 35000) + 1000; // in feet
-        const velocity = Math.floor(Math.random() * 500) + 200; // km/h
+        const alt = Math.floor(Math.random() * 35000) + 1000;
+        const velocity = Math.floor(Math.random() * 500) + 200;
         const isGrounded = alt < 3000 && Math.random() > 0.8;
         const airlineCode = airlines[Math.floor(Math.random() * airlines.length)];
 
@@ -131,21 +155,27 @@ const SafeFlightsApp = () => {
           alt: isGrounded ? 0 : alt,
           velocity: isGrounded ? 0 : velocity,
           heading: Math.floor(Math.random() * 360),
-          onGround: isGrounded
+          onGround: isGrounded,
+          squawk: Math.random() > 0.99 ? "7700" : "1000" // Rare synthetic emergency 
         });
       }
       return newFlights;
     };
 
     const fetchFlights = async () => {
-      if (!boundsRef.current) return;
+      if (!boundsRef.current || viewMode === "3D") return;
       setIsScanning(true);
       const b = boundsRef.current;
       const [lamin, lomin, lamax, lomax] = b;
 
       try {
-        // TIER 1: Primary OpenSky API
-        const res = await fetch(`https://opensky-network.org/api/states/all?lamin=${lamin}&lomin=${lomin}&lamax=${lamax}&lomax=${lomax}`);
+        let url = `https://opensky-network.org/api/states/all?lamin=${lamin}&lomin=${lomin}&lamax=${lamax}&lomax=${lomax}`;
+        if (timeOffset < 0) {
+          const targetTime = Math.floor(Date.now() / 1000) + (timeOffset * 3600);
+          url += `&time=${targetTime}`;
+        }
+
+        const res = await fetch(url);
 
         if (res.ok) {
           const data = await res.json();
@@ -158,23 +188,28 @@ const SafeFlightsApp = () => {
               airline: (state[1] ? state[1].trim() : "Private").substring(0, 3),
               lon: state[5],
               lat: state[6],
-              alt: Math.round((state[7] || 0) * 3.28084), // meters to feet
+              alt: Math.round((state[7] || 0) * 3.28084),
               onGround: state[8],
-              velocity: Math.round((state[9] || 0) * 3.6), // m/s to km/h
-              heading: Math.round(state[10] || 0)
+              velocity: Math.round((state[9] || 0) * 3.6),
+              heading: Math.round(state[10] || 0),
+              squawk: state[14]
             })).filter((f: FlightState) => f.lat && f.lon);
             setFlights(parsed);
             setDataSource("OPENSKY");
             setIsScanning(false);
+            processAlerts(parsed);
             return;
           }
         }
-        throw new Error(`OpenSky failed with status: ${res.status}`);
+        throw new Error(`OpenSky status: ${res.status}`);
       } catch (err) {
-        console.warn("Primary API failed. Engaging Fallback TIER 2 (ADSB.lol)...");
+        if (timeOffset < 0) {
+          // APIs don't easily do historic radius without auth, jump to synthetic
+          handleSyntheticFallback(b);
+          return;
+        }
 
         try {
-          // TIER 2: Secondary ADSB.lol API
           const centerLat = (lamin + lamax) / 2;
           const centerLon = (lomin + lomax) / 2;
           const radiusNm = Math.min(250, Math.max(Math.abs(lamax - lamin) * 60, Math.abs(lomax - lomin) * 60));
@@ -193,55 +228,76 @@ const SafeFlightsApp = () => {
                 lat: ac.lat,
                 alt: ac.alt_baro === "ground" ? 0 : (ac.alt_baro || 0),
                 onGround: ac.alt_baro === "ground",
-                velocity: Math.round((ac.gs || 0) * 1.852), // knots to km/h
-                heading: Math.round(ac.track || ac.tru || ac.mag || 0)
+                velocity: Math.round((ac.gs || 0) * 1.852),
+                heading: Math.round(ac.track || ac.tru || ac.mag || 0),
+                squawk: ac.squawk
               })).filter((f: FlightState) => f.lat && f.lon);
 
-              // Filter to actual bounding box just in case
               const bounded = parsed2.filter((f: FlightState) => f.lat >= lamin && f.lat <= lamax && f.lon >= lomin && f.lon <= lomax);
-
               setFlights(bounded);
               setDataSource("ADSB_LOL");
               setIsScanning(false);
+              processAlerts(bounded);
               return;
             }
           }
-          throw new Error("ADSB.lol failed as well.");
+          throw new Error("ADSB.lol failed.");
         } catch (err2) {
-          console.warn("Secondary API failed. Engaging TIER 3 Synthetic Subroutine...");
-
-          // TIER 3: Synthetic Physics Engine (Never Fail)
-          if (!active) return;
-          setFlights(prev => {
-            if (prev.length > 0 && prev[0].id.startsWith('SYN')) {
-              // Update physics ticks for existing synthetic flight
-              return prev.map(f => {
-                if (f.onGround) return f;
-                const distanceMeters = (f.velocity * 1000 / 3600) * 10; // distance over 10s tick
-                const latDelta = (distanceMeters * Math.cos(f.heading * (Math.PI / 180))) / 111000;
-                const lonDelta = (distanceMeters * Math.sin(f.heading * (Math.PI / 180))) / (111000 * Math.cos(f.lat * (Math.PI / 180)));
-                return { ...f, lat: f.lat + latDelta, lon: f.lon + lonDelta };
-              }).filter((f: FlightState) => f.lat >= Math.min(lamin, lamax) && f.lat <= Math.max(lamin, lamax) && f.lon >= Math.min(lomin, lomax) && f.lon <= Math.max(lomin, lomax));
-            } else {
-              // Generate fresh batch
-              return generateSyntheticFlights(b);
-            }
-          });
-          setDataSource("SYNTHETIC");
-          setIsScanning(false);
+          handleSyntheticFallback(b);
         }
       }
     };
 
+    const handleSyntheticFallback = (b: [number, number, number, number]) => {
+      const [lamin, lomin, lamax, lomax] = b;
+      if (!active) return;
+      setFlights(prev => {
+        let nextFlights = [];
+        if (prev.length > 0 && prev[0].id.startsWith('SYN')) {
+          nextFlights = prev.map(f => {
+            if (f.onGround) return f;
+            const distanceMeters = (f.velocity * 1000 / 3600) * 10;
+            const latDelta = (distanceMeters * Math.cos(f.heading * (Math.PI / 180))) / 111000;
+            const lonDelta = (distanceMeters * Math.sin(f.heading * (Math.PI / 180))) / (111000 * Math.cos(f.lat * (Math.PI / 180)));
+            return { ...f, lat: f.lat + latDelta, lon: f.lon + lonDelta };
+          });
+        } else {
+          nextFlights = generateSyntheticFlights(b);
+        }
+        processAlerts(nextFlights);
+        return nextFlights;
+      });
+      setDataSource("SYNTHETIC");
+      setIsScanning(false);
+    };
+
+    const processAlerts = (activeFlights: FlightState[]) => {
+      // Squawk Checks
+      const emergenciesActive = activeFlights.filter(f => f.squawk === '7700' || f.squawk === '7600' || f.squawk === '7500');
+      setEmergencies(emergenciesActive);
+
+      // GeoFence Checks
+      const geoViolations: { flight: string, zone: string }[] = [];
+      activeFlights.forEach(f => {
+        if (!f.lon || !f.lat) return;
+        const pt = point([f.lon, f.lat]);
+        THREAT_ZONES.forEach(zone => {
+          // Turf requires longitude, latitude ordering and closed linear rings
+          const coords = [...zone.coords, zone.coords[0]].map(c => [c[1], c[0]]);
+          const poly = polygon([coords]);
+          if (booleanPointInPolygon(pt, poly)) {
+            geoViolations.push({ flight: f.num, zone: zone.name });
+          }
+        });
+      });
+      setGeofenceAlerts(geoViolations);
+    };
+
     fetchFlights();
     const interval = setInterval(fetchFlights, 10000);
-    return () => {
-      active = false;
-      clearInterval(interval);
-    };
-  }, []);
+    return () => { active = false; clearInterval(interval); };
+  }, [timeOffset, viewMode]);
 
-  // Fetch track line & hexdb details for selected flight
   useEffect(() => {
     if (!selectedFlight) {
       setSelectedFlightTrack([]);
@@ -249,7 +305,6 @@ const SafeFlightsApp = () => {
       return;
     }
 
-    // Fetch Aircraft HexDB Details (Type, Reg, Logo)
     const fetchDetails = async () => {
       try {
         const res = await fetch(`https://hexdb.io/api/v1/aircraft/${selectedFlight.id}`);
@@ -257,15 +312,15 @@ const SafeFlightsApp = () => {
           const data = await res.json();
           setSelectedFlightDetails(data);
         }
-      } catch (err) {
-        console.error("HexDB API Error: ", err);
-      }
+      } catch (err) { }
     };
 
-    // Fetch Historical Track with Fallback
     const fetchTrack = async () => {
       try {
-        const res = await fetch(`https://opensky-network.org/api/tracks/all?icao24=${selectedFlight.id}&time=0`);
+        const url = timeOffset < 0
+          ? `https://opensky-network.org/api/tracks/all?icao24=${selectedFlight.id}&time=${Math.floor(Date.now() / 1000) + (timeOffset * 3600)}`
+          : `https://opensky-network.org/api/tracks/all?icao24=${selectedFlight.id}&time=0`;
+        const res = await fetch(url);
         if (res.ok) {
           const data = await res.json();
           if (data && data.path) {
@@ -274,47 +329,29 @@ const SafeFlightsApp = () => {
             return;
           }
         }
-        throw new Error("OpenSky Track fallback triggered");
+        throw new Error("OpenSky Track fallback");
       } catch (err) {
-        try {
-          // Fallback to ADSB.lol trace
-          const res2 = await fetch(`https://api.adsb.lol/v2/trace/${selectedFlight.id}`);
-          if (res2.ok) {
-            const data2 = await res2.json();
-            if (data2 && data2.trace) {
-              const trackPositions: [number, number][] = data2.trace.map((p: any) => [p[1], p[2]]);
-              setSelectedFlightTrack([...trackPositions, [selectedFlight.lat, selectedFlight.lon]]);
-              return;
+        if (timeOffset === 0) {
+          try {
+            const res2 = await fetch(`https://api.adsb.lol/v2/trace/${selectedFlight.id}`);
+            if (res2.ok) {
+              const data2 = await res2.json();
+              if (data2 && data2.trace) {
+                const trackPositions: [number, number][] = data2.trace.map((p: any) => [p[1], p[2]]);
+                setSelectedFlightTrack([...trackPositions, [selectedFlight.lat, selectedFlight.lon]]);
+                return;
+              }
             }
-          }
-        } catch (fallbackErr) {
-          console.error("Track API Fallbacks exhausted: ", fallbackErr);
+          } catch (e) { }
         }
-        // If everything fails, default to plotting nothing
         setSelectedFlightTrack([]);
       }
     };
 
     fetchDetails();
     fetchTrack();
-  }, [selectedFlight]);
+  }, [selectedFlight, timeOffset]);
 
-  // Live Flight Local Search
-  useEffect(() => {
-    if (!searchQuery) {
-      setLiveSearchResults([]);
-      return;
-    }
-    const q = searchQuery.toLowerCase();
-    const matches = flights.filter(f =>
-      f.num.toLowerCase().includes(q) ||
-      f.airline.toLowerCase().includes(q) ||
-      f.country.toLowerCase().includes(q)
-    ).slice(0, 5);
-    setLiveSearchResults(matches);
-  }, [searchQuery, flights]);
-
-  // Handle Airport Searching
   const handleAirportSearch = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!searchQuery) return;
@@ -323,23 +360,20 @@ const SafeFlightsApp = () => {
       const response = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(searchQuery)}+airport&format=json&limit=5`);
       const data = await response.json();
       setSearchResults(data);
-    } catch (err) {
-      console.error("Search API Error: ", err);
-    }
+    } catch (err) { }
     setIsSearching(false);
   };
 
   const flyToAirportResult = (lat: string, lon: string, name: string) => {
-    const plat = parseFloat(lat);
-    const plon = parseFloat(lon);
-    setFlyToLocation([plat, plon]);
-    setSelectedAirportBoard({ name: name.split(',')[0], lat: plat, lon: plon });
-    setSelectedFlight(null);
+    setViewMode("2D");
+    setFlyToLocation([parseFloat(lat), parseFloat(lon)]);
+    setSelectedAirportBoard({ name: name.split(',')[0], lat: parseFloat(lat), lon: parseFloat(lon) });
     setSearchResults([]);
     setSearchQuery("");
   };
 
   const handleFlightSelect = (flight: FlightState) => {
+    setViewMode("2D");
     setSelectedFlight(flight);
     setSelectedAirportBoard(null);
     setFlyToLocation([flight.lat, flight.lon]);
@@ -348,328 +382,271 @@ const SafeFlightsApp = () => {
     setSearchQuery("");
   };
 
-  // Generate Synthetic Board
   const getTerminalSchedule = React.useCallback((airportName: string) => {
     const airlines = ['EK', 'FZ', 'BA', 'LH', 'AF', 'SQ', 'QR', 'AA', 'UA', 'DL'];
     const cities = ['London', 'New York', 'Paris', 'Tokyo', 'Singapore', 'Mumbai', 'Frankfurt', 'Sydney', 'Cairo', 'Istanbul', 'Beijing'];
-    // Use a pseudo-random seed based on name length to keep it somewhat stable during render
     let seed = airportName.length;
-    const random = () => {
-      const x = Math.sin(seed++) * 10000;
-      return x - Math.floor(x);
-    };
-
+    const random = () => { const x = Math.sin(seed++) * 10000; return x - Math.floor(x); };
     const s = [];
     const now = new Date();
     for (let i = 0; i < 15; i++) {
       const isArr = random() > 0.5;
-      const time = new Date(now.getTime() + (random() * 86400000) - 43200000); // within +/- 12 hrs
+      const time = new Date(now.getTime() + (random() * 86400000) - 43200000);
       s.push({
-        id: i,
-        timeObj: time,
-        time: time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        id: i, timeObj: time, time: time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         flight: airlines[Math.floor(random() * airlines.length)] + Math.floor(random() * 900 + 100),
-        city: cities[Math.floor(random() * cities.length)],
-        type: isArr ? "Arrival" : "Departure",
-        status: random() > 0.85 ? "Delayed" : "On Time"
+        city: cities[Math.floor(random() * cities.length)], type: isArr ? "Arrival" : "Departure", status: random() > 0.85 ? "Delayed" : "On Time"
       });
     }
     return s.sort((a, b) => a.timeObj.getTime() - b.timeObj.getTime());
   }, []);
 
   return (
-    <div className="app-layout">
+    <div className="app-layout flex flex-col h-screen overflow-hidden">
       {/* Top Navigation */}
-      <nav className="top-nav">
-        <div className="brand">
-          <ShieldAlert className="brand-icon" size={24} />
-          SafeFlights Global | Tracking Radar
+      <nav className={`top-nav flex items-center px-6 py-3 border-b ${emergencies.length > 0 ? 'bg-red-950/40 border-red-500/50' : 'bg-zinc-950 border-zinc-800'} transition-colors duration-500 z-50`}>
+        <div className="brand flex items-center gap-3 text-lg font-bold">
+          <ShieldAlert className={emergencies.length > 0 ? "text-red-500 animate-pulse" : "text-blue-500"} size={24} />
+          <span>SafeFlights <span className="text-zinc-500 font-normal">Global Tracker</span></span>
         </div>
 
-        {/* Full-World Airport Search Bar */}
-        <form onSubmit={handleAirportSearch} style={{ position: 'relative', flex: 1, maxWidth: '500px', margin: '0 2rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', backgroundColor: 'var(--bg-base)', border: '1px solid var(--border-focus)', borderRadius: '6px', padding: '0.4rem 0.8rem' }}>
-            <Search size={16} color="var(--text-muted)" style={{ marginRight: '0.5rem' }} />
-            <input
-              type="text"
-              placeholder="Search Aircraft Call-sign, Airline, or Airport..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              style={{ backgroundColor: 'transparent', border: 'none', color: 'white', width: '100%', outline: 'none', fontSize: '0.85rem' }}
+        <form onSubmit={handleAirportSearch} className="flex-1 max-w-lg mx-8 relative">
+          <div className="flex items-center bg-zinc-900 border border-zinc-700 rounded-md px-3 py-2 focus-within:border-blue-500 transition-colors">
+            <Search size={16} className="text-zinc-400 mr-2" />
+            <input type="text" placeholder="Search Callsign, Airline, or Airport..." value={searchQuery} onChange={(e) => {
+              setSearchQuery(e.target.value);
+              const q = e.target.value.toLowerCase();
+              setLiveSearchResults(q ? flights.filter(f => f.num.toLowerCase().includes(q) || f.airline.toLowerCase().includes(q)).slice(0, 5) : []);
+            }}
+              className="bg-transparent border-none text-white w-full outline-none text-sm"
             />
-            {searchQuery && (
-              <X size={16} color="var(--text-muted)" style={{ cursor: 'pointer' }} onClick={() => { setSearchQuery(""); setSearchResults([]); setLiveSearchResults([]); }} />
-            )}
+            {searchQuery && <X size={16} className="text-zinc-400 cursor-pointer" onClick={() => { setSearchQuery(""); setSearchResults([]); setLiveSearchResults([]); }} />}
           </div>
 
-          {/* Dropdown Results */}
           {(searchResults.length > 0 || liveSearchResults.length > 0) && (
-            <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, marginTop: '0.5rem', backgroundColor: 'var(--bg-surface)', border: '1px solid var(--border-focus)', borderRadius: '6px', zIndex: 2000, overflow: 'hidden', boxShadow: '0 10px 25px rgba(0,0,0,0.5)' }}>
-
-              {liveSearchResults.length > 0 && (
-                <div>
-                  <div style={{ padding: '0.5rem 1rem', fontSize: '0.65rem', textTransform: 'uppercase', fontWeight: 700, color: 'var(--color-blue)', backgroundColor: 'rgba(59, 130, 246, 0.1)' }}>Live Aircraft In View</div>
-                  {liveSearchResults.map(flight => (
-                    <div
-                      key={flight.id}
-                      onClick={() => handleFlightSelect(flight)}
-                      style={{ padding: '0.75rem 1rem', display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', borderBottom: '1px solid var(--border-subtle)', cursor: 'pointer' }}
-                      className="search-result-hover"
-                    >
-                      <Plane size={14} color="var(--text-muted)" />
-                      <div>
-                        <div style={{ fontWeight: 600, color: 'var(--text-main)' }}>{flight.num} <span style={{ color: 'var(--text-muted)', fontWeight: 400, fontSize: '0.7rem' }}>({flight.airline})</span></div>
-                        <div style={{ color: 'var(--text-muted)', fontSize: '0.7rem' }}>{flight.velocity} km/h • {flight.alt} ft</div>
-                      </div>
-                    </div>
-                  ))}
+            <div className="absolute top-full left-0 right-0 mt-2 bg-zinc-900 border border-zinc-700 rounded-md z-50 shadow-2xl overflow-hidden">
+              {liveSearchResults.map(f => (
+                <div key={f.id} onClick={() => handleFlightSelect(f)} className="px-4 py-3 hover:bg-zinc-800 cursor-pointer flex justify-between items-center border-b border-zinc-800 last:border-0">
+                  <div className="flex items-center gap-3"><Plane size={16} className="text-blue-400" /> <span className="font-mono font-bold">{f.num}</span></div>
+                  <span className="text-xs text-zinc-400">{f.velocity} km/h • {f.alt} ft</span>
                 </div>
-              )}
-
-              {searchResults.length > 0 && (
-                <div>
-                  <div style={{ padding: '0.5rem 1rem', fontSize: '0.65rem', textTransform: 'uppercase', fontWeight: 700, color: 'var(--color-orange)', backgroundColor: 'rgba(249, 115, 22, 0.1)' }}>Airports & Locations</div>
-                  {searchResults.map((res: any) => (
-                    <div
-                      key={res.place_id}
-                      onClick={() => flyToAirportResult(res.lat, res.lon, res.display_name)}
-                      style={{ padding: '0.75rem 1rem', display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.8rem', borderBottom: '1px solid var(--border-subtle)', cursor: 'pointer' }}
-                      className="search-result-hover"
-                    >
-                      <MapIcon size={14} color="var(--text-muted)" />
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontWeight: 600, color: 'var(--text-main)', marginBottom: '0.2rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{res.display_name.split(',')[0]}</div>
-                        <div style={{ color: 'var(--text-muted)', fontSize: '0.7rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{res.display_name}</div>
-                      </div>
-                    </div>
-                  ))}
+              ))}
+              {searchResults.map((res: any) => (
+                <div key={res.place_id} onClick={() => flyToAirportResult(res.lat, res.lon, res.display_name)} className="px-4 py-3 hover:bg-zinc-800 cursor-pointer flex items-center gap-3 border-b border-zinc-800 last:border-0">
+                  <MapIcon size={16} className="text-orange-400" /> <span className="truncate flex-1 text-sm">{res.display_name}</span>
                 </div>
-              )}
+              ))}
             </div>
           )}
         </form>
 
-        <div className="nav-metrics">
-          <div className="metric-pill">
-            <Clock size={14} />
-            {currentTime.toISOString().split('T')[1].substring(0, 8)} UTC
+        <div className="flex items-center gap-4 text-xs font-mono">
+          <button onClick={() => setIsHeatmap(!isHeatmap)} className={`flex items-center gap-2 px-3 py-1.5 rounded border transition-colors ${isHeatmap ? 'bg-orange-500/20 border-orange-500/50 text-orange-400' : 'bg-transparent border-zinc-700 text-zinc-400 hover:text-zinc-200'}`}>
+            <ThermometerSun size={14} /> Altitude Heatmap
+          </button>
+          <button onClick={() => setViewMode(viewMode === "2D" ? "3D" : "2D")} className={`flex items-center gap-2 px-3 py-1.5 rounded border transition-colors ${viewMode === "3D" ? 'bg-blue-500/20 border-blue-500/50 text-blue-400' : 'bg-transparent border-zinc-700 text-zinc-400 hover:text-zinc-200'}`}>
+            <Globe size={14} /> {viewMode === "2D" ? "Enable 3D Globe" : "Return to 2D"}
+          </button>
+
+          <div className="flex items-center gap-2 px-3 py-1.5 bg-zinc-900 rounded text-zinc-300">
+            <Clock size={14} /> {currentTime.toISOString().split('T')[1].substring(0, 8)} {timeOffset !== 0 && `(HISTORICAL)`}
           </div>
-          <div className="metric-pill" style={{ color: dataSource === 'OPENSKY' ? 'var(--color-green)' : dataSource === 'ADSB_LOL' ? 'var(--color-orange)' : 'var(--color-red)' }}>
-            DATA: {dataSource}
-          </div>
-          <div className={`metric-pill ${isScanning ? 'scanning' : ''}`}>
-            {isScanning ? <Activity size={14} /> : <SignalHigh size={14} />}
-            {isScanning ? 'SCANNING' : 'ONLINE'}
+          <div className="flex items-center gap-2 px-3 py-1.5 bg-zinc-900 rounded font-bold" style={{ color: dataSource === 'OPENSKY' ? '#10b981' : dataSource === 'ADSB_LOL' ? '#f97316' : '#ef4444' }}>
+            <Activity size={14} /> {dataSource}
           </div>
         </div>
       </nav>
 
       {/* Main Workspace */}
-      <main className="main-workspace">
-
+      <main className="flex-1 flex overflow-hidden relative">
         {/* Left Side Panel */}
-        <aside className="side-panel">
-          {selectedAirportBoard ? (
-            <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
-              <div className="panel-section" style={{ paddingBottom: '1rem', borderBottom: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <div className="panel-title" style={{ margin: 0 }}>
-                  <MapIcon size={14} />
-                  Terminal Schedule
-                </div>
-                <X size={16} color="var(--text-muted)" style={{ cursor: 'pointer' }} onClick={() => setSelectedAirportBoard(null)} />
-              </div>
-              <div style={{ padding: '1rem', overflowY: 'auto', flex: 1 }}>
-                <h3 style={{ margin: '0 0 0.5rem 0', color: 'var(--text-main)', fontSize: '1.2rem' }}>{selectedAirportBoard.name}</h3>
-                <div style={{ color: 'var(--text-muted)', fontSize: '0.75rem', marginBottom: '1.5rem', fontFamily: 'monospace' }}>
-                  LAT: {selectedAirportBoard.lat.toFixed(4)} • LON: {selectedAirportBoard.lon.toFixed(4)}
-                </div>
+        <aside className="w-80 bg-zinc-950 border-r border-zinc-800 flex flex-col z-40 shrink-0">
 
-                <div style={{ display: 'grid', gridTemplateColumns: 'min-content 1fr', gap: '1rem' }}>
-                  {getTerminalSchedule(selectedAirportBoard.name).map((s) => (
-                    <React.Fragment key={s.id}>
-                      <div style={{ color: 'var(--text-muted)', fontSize: '0.85rem', fontWeight: 500, paddingTop: '0.2rem' }}>{s.time}</div>
-                      <div style={{ borderBottom: '1px solid var(--border-focus)', paddingBottom: '0.75rem', marginBottom: '0.75rem' }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '0.2rem' }}>
-                          <span style={{ fontWeight: 600, color: 'var(--color-blue)', fontFamily: 'monospace', fontSize: '0.9rem' }}>{s.flight}</span>
-                          <span style={{ fontSize: '0.7rem', fontWeight: 600, textTransform: 'uppercase', color: s.type === 'Arrival' ? 'var(--color-orange)' : 'var(--color-green)' }}>{s.type}</span>
-                        </div>
-                        <div style={{ fontSize: '0.8rem', color: 'var(--text-main)', marginBottom: '0.3rem' }}>{s.type === 'Arrival' ? 'From' : 'To'} {s.city}</div>
-                        <div style={{ fontSize: '0.7rem', color: s.status === 'Delayed' ? 'var(--color-red)' : 'var(--text-muted)' }}>{s.status}</div>
-                      </div>
-                    </React.Fragment>
-                  ))}
+          {emergencies.length > 0 && (
+            <div className="p-4 bg-red-950 border-b border-red-900">
+              <div className="text-red-500 font-bold flex items-center gap-2 mb-2 uppercase text-xs tracking-wider">
+                <AlertTriangle size={14} className="animate-pulse" /> Emergency Squawk
+              </div>
+              {emergencies.map(f => (
+                <div key={f.id} className="text-sm cursor-pointer hover:bg-red-900/50 p-2 rounded transition-colors" onClick={() => handleFlightSelect(f)}>
+                  <span className="font-mono font-bold mr-2">{f.num}</span>
+                  Squawking {f.squawk} at {f.alt} ft
                 </div>
+              ))}
+            </div>
+          )}
+
+          {geofenceAlerts.length > 0 && (
+            <div className="p-4 bg-orange-950 border-b border-orange-900">
+              <div className="text-orange-500 font-bold flex items-center gap-2 mb-2 uppercase text-xs tracking-wider">
+                <ShieldAlert size={14} /> Restricted Airspace Violation
+              </div>
+              {geofenceAlerts.slice(0, 3).map((a, i) => (
+                <div key={i} className="text-sm text-zinc-300 mb-1">
+                  <span className="font-mono font-bold text-white mr-1">{a.flight}</span>
+                  entered {a.zone}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {selectedAirportBoard ? (
+            <div className="flex-1 flex flex-col p-5 overflow-y-auto">
+              <div className="flex items-center justify-between mb-4">
+                <div className="text-xs uppercase tracking-wider text-zinc-500 font-bold flex items-center gap-2"><MapIcon size={14} /> Terminal Schedule</div>
+                <X size={16} className="text-zinc-500 cursor-pointer hover:text-white" onClick={() => setSelectedAirportBoard(null)} />
+              </div>
+              <h2 className="text-xl font-bold text-white mb-6">{selectedAirportBoard.name}</h2>
+              <div className="flex flex-col gap-4">
+                {getTerminalSchedule(selectedAirportBoard.name).map(s => (
+                  <div key={s.id} className="pb-4 border-b border-zinc-800 last:border-0">
+                    <div className="flex justify-between items-center mb-1">
+                      <span className="text-blue-400 font-mono font-bold">{s.flight}</span>
+                      <span className={`text-[10px] uppercase font-bold px-2 py-0.5 rounded ${s.type === 'Arrival' ? 'bg-orange-500/20 text-orange-400' : 'bg-green-500/20 text-green-400'}`}>{s.type}</span>
+                    </div>
+                    <div className="text-sm text-zinc-300 mb-1">{s.type === 'Arrival' ? 'From' : 'To'} {s.city}</div>
+                    <div className="flex justify-between text-xs">
+                      <span className="text-zinc-500 font-mono">{s.time}</span>
+                      <span className={s.status === 'Delayed' ? 'text-red-400' : 'text-zinc-500'}>{s.status}</span>
+                    </div>
+                  </div>
+                ))}
               </div>
             </div>
           ) : (
-            <>
-              <div className="panel-section" style={{ paddingBottom: 0, borderBottom: 'none' }}>
-                <div className="panel-title">
-                  <Plane size={14} />
-                  Radar Feed ({flights.length})
-                </div>
+            <div className="flex-1 flex flex-col p-4 overflow-y-auto">
+              <div className="text-xs uppercase tracking-wider text-zinc-500 font-bold flex items-center gap-2 mb-4 pb-4 border-b border-zinc-800">
+                <Plane size={14} /> Active Radar Feed ({flights.length})
               </div>
-
-              <div className="flight-feed">
-                <AnimatePresence>
-                  {flights.length === 0 && (
-                    <div className="flight-empty">
-                      <Activity size={32} style={{ marginBottom: '1rem', opacity: 0.5 }} />
-                      {isScanning ? 'Scanning Airspace...' : 'No Aircraft in View'}
-                    </div>
-                  )}
-
-                  {flights.map((flight) => {
+              <div className="flex flex-col gap-3">
+                {flights.length === 0 ? (
+                  <div className="text-center text-zinc-600 my-10"><Activity size={32} className="mx-auto mb-3 opacity-50" /> {isScanning ? 'Scanning...' : 'No Aircraft'}</div>
+                ) : (
+                  flights.slice(0, 50).map(flight => {
                     const isActive = selectedFlight?.id === flight.id;
+                    const bColor = isActive ? 'border-blue-500 bg-blue-900/10' : 'border-zinc-800 bg-zinc-900/50 hover:border-zinc-600';
                     return (
-                      <motion.div
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, scale: 0.95 }}
-                        key={flight.id}
-                        className="flight-card"
-                        style={{ borderColor: isActive ? 'var(--color-blue)' : '' }}
-                        onClick={() => handleFlightSelect(flight)}
-                      >
-                        <div className="fc-header">
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-                            {/* If it's the active card we show the logo if we have it, else fallback */}
-                            {isActive && selectedFlightDetails?.OperatorFlagCode ? (
-                              <img
-                                src={`https://pics.avs.io/200/200/${selectedFlightDetails.OperatorFlagCode}.png`}
-                                alt="Logo"
-                                style={{ width: '32px', height: '32px', objectFit: 'contain', backgroundColor: '#fff', borderRadius: '4px', padding: '2px' }}
-                                onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                              />
-                            ) : (
-                              <div style={{ width: '32px', height: '32px', backgroundColor: 'var(--bg-base)', borderRadius: '4px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                                <Plane size={16} />
-                              </div>
-                            )}
-
-                            <div>
-                              <div className="fc-ident">{flight.num}</div>
-                              <div className="fc-airline">
-                                {isActive && selectedFlightDetails ? `${selectedFlightDetails.Type || ''} (${selectedFlightDetails.Registration || flight.id})` : flight.country}
-                              </div>
-                            </div>
+                      <div key={flight.id} onClick={() => handleFlightSelect(flight)} className={`p-4 rounded-lg border ${bColor} cursor-pointer transition-all`}>
+                        <div className="flex justify-between items-start mb-3">
+                          <div>
+                            <div className="font-mono font-bold text-white text-lg leading-none mb-1">{flight.num}</div>
+                            <div className="text-xs text-zinc-500 uppercase tracking-widest">{flight.country}</div>
                           </div>
-                          <div className={`fc-status ${flight.onGround ? 'grounded' : ''}`}>
-                            {flight.onGround ? 'Grounded' : 'Airborne'}
-                          </div>
+                          <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded ${flight.onGround ? 'bg-orange-500/20 text-orange-400' : 'bg-zinc-800 text-zinc-300'}`}>
+                            {flight.onGround ? 'GND' : 'AIR'}
+                          </span>
                         </div>
-
-                        <div className="fc-metrics">
-                          <div className="fc-metric-group">
-                            <span className="fc-metric-label">Altitude</span>
-                            <span className="fc-metric-value">
-                              {flight.onGround ? '0' : flight.alt} ft
-                            </span>
-                          </div>
-                          <div className="fc-metric-group">
-                            <span className="fc-metric-label">Speed</span>
-                            <span className="fc-metric-value">
-                              {flight.velocity} km/h
-                            </span>
-                          </div>
+                        <div className="grid grid-cols-2 gap-2 text-xs font-mono">
+                          <div><span className="text-zinc-600 mr-2">ALT</span><span className="text-green-400">{flight.alt} ft</span></div>
+                          <div><span className="text-zinc-600 mr-2">SPD</span><span className="text-zinc-300">{flight.velocity} km</span></div>
                         </div>
-                      </motion.div>
-                    );
-                  })}
-                </AnimatePresence>
+                      </div>
+                    )
+                  })
+                )}
               </div>
-            </>
+            </div>
           )}
-        </aside>          {/* Live Map Area */}
-        <section className="map-container">
-          <MapContainer
-            center={[CENTER_LAT, CENTER_LON]}
-            zoom={6}
-            zoomControl={false}
-            style={{ width: '100%', height: '100%' }}
-          >
-            <MapBoundsFetcher boundsRef={boundsRef} />
-            <MapUpdater flyToLocation={flyToLocation} />
+        </aside>
 
-            <TileLayer
-              attribution='&copy; <a href="https://carto.com/attributions">CARTO</a>'
-              url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-            />
+        {/* Cinematic Map / 3D Canvas area */}
+        <section className="flex-1 relative bg-[#09090b]">
+          {viewMode === "3D" ? (
+            <div className="absolute inset-0 z-10 fade-in pointer-events-auto flex flex-col">
+              <div className="absolute top-4 left-4 z-20 bg-black/50 backdrop-blur-md p-4 rounded-lg border border-zinc-800 text-white max-w-sm">
+                <h3 className="font-bold text-lg mb-2 flex items-center gap-2"><Globe className="text-blue-400" /> Immersive 3D View</h3>
+                <p className="text-sm text-zinc-400">Interact with the globe to explore the situational theater in full 3D space utilizing the Spline runtime engine. Drag to rotate, scroll to zoom.</p>
+              </div>
+              {/* Spline globe injection */}
+              <div className="w-full h-full relative cursor-move">
+                <GlobeComponent
+                  globeImageUrl="https://unpkg.com/three-globe/example/img/earth-blue-marble.jpg"
+                  bumpImageUrl="https://unpkg.com/three-globe/example/img/earth-topology.png"
+                  backgroundImageUrl="https://unpkg.com/three-globe/example/img/night-sky.png"
+                  pointsData={flights}
+                  pointLat={d => (d as FlightState).lat}
+                  pointLng={d => (d as FlightState).lon}
+                  pointAltitude={d => ((d as FlightState).alt / 35000) * 0.1} // Scale altitude
+                  pointColor={d => isHeatmap ? getHeatmapColor((d as FlightState).alt) : ((d as FlightState).squawk === '7700' ? '#ff0000' : '#FFD700')}
+                  pointRadius={0.4}
+                  pointsMerge={false}
+                  onPointClick={(d) => handleFlightSelect(d as FlightState)}
+                />
+              </div>
+            </div>
+          ) : (
+            <MapContainer center={[CENTER_LAT, CENTER_LON]} zoom={5} zoomControl={false} style={{ width: '100%', height: '100%', zIndex: 0 }}>
+              <MapBoundsFetcher boundsRef={boundsRef} />
+              <MapUpdater flyToLocation={flyToLocation} />
+              <TileLayer url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" />
 
-            {selectedFlightTrack.length > 0 && (
-              <Polyline
-                positions={selectedFlightTrack}
-                pathOptions={{ color: '#ef4444', weight: 4, opacity: 0.7 }}
+              {/* Restricted GeoFences */}
+              {THREAT_ZONES.map(zone => (
+                <Polygon key={zone.name} positions={zone.coords} pathOptions={{ color: zone.color, fillColor: zone.color, fillOpacity: 0.15, weight: 1 }}>
+                  <Popup className="tactical-popup border-orange-500"><div className="font-bold text-orange-500 uppercase">{zone.name}</div></Popup>
+                </Polygon>
+              ))}
+
+              {selectedFlightTrack.length > 0 && <Polyline positions={selectedFlightTrack} pathOptions={{ color: '#ef4444', weight: 4, opacity: 0.8 }} />}
+
+              {flights.map(flight => (
+                <Marker key={flight.id} position={[flight.lat, flight.lon]} icon={createPlaneIcon(flight.heading, flight.id === selectedFlight?.id, flight.alt, isHeatmap, flight.squawk)} eventHandlers={{ click: () => handleFlightSelect(flight) }}>
+                  <Popup className="tactical-popup" closeButton={false}>
+                    <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-4 shadow-2xl min-w-[260px]">
+                      <div className="flex gap-4 items-center border-b border-zinc-800 pb-4 mb-4">
+                        <div className="w-12 h-12 bg-white rounded flex items-center justify-center p-1 overflow-hidden shrink-0">
+                          <img src={`https://flightaware.com/images/airline_logos/90p/${selectedFlightDetails?.OperatorFlagCode || flight.airline}.png`} style={{ width: '100%', height: '100%', objectFit: 'contain' }} onError={(e) => { e.currentTarget.style.display = 'none' }} />
+                        </div>
+                        <div>
+                          <div className="text-xl font-bold font-mono text-white leading-none mb-1">{flight.num}</div>
+                          <div className="text-[10px] text-zinc-400 font-bold uppercase tracking-wider">{selectedFlightDetails?.Type || 'AIRCRAFT UNKNOWN'}</div>
+                          <div className="text-[10px] text-zinc-500 font-mono mt-1">REG: {selectedFlightDetails?.Registration || flight.id.toUpperCase()}</div>
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-2 gap-y-4 gap-x-2 text-xs font-mono">
+                        <div><div className="text-[9px] text-zinc-600 uppercase mb-1">True Track</div><div className="text-zinc-200 flex items-center gap-1"><Compass size={12} />{flight.heading}°</div></div>
+                        <div><div className="text-[9px] text-zinc-600 uppercase mb-1">Gnd Speed</div><div className="text-zinc-200">{flight.velocity} km/h</div></div>
+                        <div><div className="text-[9px] text-zinc-600 uppercase mb-1">Baro Alt</div><div className="text-green-400">{flight.alt} ft</div></div>
+                        <div><div className="text-[9px] text-zinc-600 uppercase mb-1">Squawk</div><div className={flight.squawk === '7700' ? "text-red-500 font-bold animate-pulse" : "text-zinc-400"}>{flight.squawk || 'NONE'}</div></div>
+                      </div>
+                    </div>
+                  </Popup>
+                </Marker>
+              ))}
+            </MapContainer>
+          )}
+
+          {/* Timeline Replay Scrubber (Pinned to bottom of the map section) */}
+          <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-black/90 to-transparent z-40 pointer-events-auto">
+            <div className="max-w-4xl mx-auto bg-zinc-950/80 backdrop-blur border border-zinc-800 rounded-xl p-4 flex flex-col gap-3 shadow-2xl">
+              <div className="flex justify-between items-center text-xs font-bold uppercase tracking-wider">
+                <span className="text-zinc-400 flex items-center gap-2"><History size={14} /> Historical Replay Timeframe</span>
+                <span className={timeOffset === 0 ? "text-green-400" : "text-orange-400"}>
+                  {timeOffset === 0 ? "LIVE" : `${Math.abs(timeOffset)} HOURS AGO`}
+                </span>
+              </div>
+              <input
+                type="range" min="-24" max="0" step="1"
+                value={timeOffset}
+                onChange={(e) => setTimeOffset(parseInt(e.target.value))}
+                className="w-full accent-blue-500"
               />
-            )}
-
-            {flights.map(flight => (
-              <Marker
-                key={flight.id}
-                position={[flight.lat, flight.lon]}
-                icon={createPlaneIcon(flight.heading, flight.id === selectedFlight?.id)}
-                eventHandlers={{
-                  click: () => handleFlightSelect(flight)
-                }}
-              >
-                <Popup className="tactical-popup border border-zinc-700 rounded-md !bg-zinc-900 !text-zinc-100 p-0 shadow-xl overflow-hidden drop-shadow-lg" closeButton={false}>
-                  <div className="p-3 min-w-[240px] font-sans">
-                    <div className="flex gap-3 items-center mb-3 pb-3 border-b border-zinc-800">
-                      <div className="bg-white rounded p-0.5 overflow-hidden flex items-center justify-center" style={{ width: '48px', height: '48px' }}>
-                        <img
-                          src={`https://pics.avs.io/200/200/${selectedFlightDetails?.OperatorFlagCode || flight.airline}.png`}
-                          alt="Logo"
-                          style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-                          onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                        />
-                      </div>
-                      <div>
-                        <h3 className="font-mono font-bold text-xl text-blue-400 m-0 leading-none">{flight.num}</h3>
-                        <div className="text-[10px] text-zinc-400 mt-1 uppercase tracking-wide">
-                          {selectedFlightDetails?.Type || 'Aircraft Type Unknown'}
-                        </div>
-                        <div className="text-[10px] text-zinc-500 font-mono tracking-wide">
-                          REG: {selectedFlightDetails?.Registration || flight.id.toUpperCase()}
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-y-3 gap-x-4 font-mono text-xs">
-                      <div>
-                        <div className="text-zinc-500 uppercase text-[9px] mb-1">True Trk</div>
-                        <div className="text-zinc-100 flex items-center gap-1">
-                          <Compass size={12} className="text-zinc-400" />
-                          {flight.heading}°
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-zinc-500 uppercase text-[9px] mb-1">Gnd Speed</div>
-                        <div className="text-zinc-100">{flight.velocity} km/h</div>
-                      </div>
-                      <div>
-                        <div className="text-zinc-500 uppercase text-[9px] mb-1">Baro Alt</div>
-                        <div className="text-green-400">{flight.alt} ft</div>
-                      </div>
-                      <div>
-                        <div className="text-zinc-500 uppercase text-[9px] mb-1">Fl. Status</div>
-                        <div className={flight.onGround ? "text-orange-400" : "text-blue-400"}>
-                          {flight.onGround ? "GROUNDED" : "AIRBORNE"}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </Popup>
-              </Marker>
-            ))}
-          </MapContainer>
+              <div className="flex justify-between text-[10px] text-zinc-600 font-mono font-bold">
+                <span>-24H</span><span>-18H</span><span>-12H</span><span>-6H</span><span>NOW</span>
+              </div>
+            </div>
+          </div>
         </section>
 
       </main>
 
       <style>{`
-        .search-result-hover:hover {
-          background-color: var(--border-focus);
-        }
+        .search-result-hover:hover { background-color: var(--border-focus); }
+        .fade-in { animation: fadeIn 1s ease-in-out; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        /* Reset Leaflet popups */
+        .leaflet-popup-content-wrapper { background: transparent !important; box-shadow: none !important; padding: 0 !important; border-radius: 0 !important; }
+        .leaflet-popup-tip-container { display: none !important; }
       `}</style>
     </div>
   );
